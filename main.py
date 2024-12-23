@@ -12,11 +12,15 @@ import torch
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2Config, DataCollatorForLanguageModeling, Trainer, TrainingArguments
 from datasets import Dataset
 
+# Ask: who is Muhammad?
+# These parameters work fine.
+mode = 'pretrained'
 max_epochs = 10
 batch_size = 8
 context_window = 1024
 temperature = None  # 1.2 # or None
 seed = 42
+learning_rate=2e-5
 
 # Check if GPU is available
 # pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
@@ -73,9 +77,60 @@ def preprocess_text(file_path, context_window):
 
 
 # https://huggingface.co/docs/transformers/en/model_doc/gpt2
-def train_model_on_texts(text_file, output_dir="./fine_tuned_model"):
+def train_model_pretrained_on_texts(text_file, output_dir="./fine_tuned_model"):
     global device, max_epochs, batch_size
-    global context_window
+    global context_window, learning_rate
+    
+    model_name = "gpt2"
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token  # Ensure padding token is set
+
+    model = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+
+    # Preprocess the text data
+    dataset = preprocess_text(text_file, context_window)
+    
+    # Tokenize the dataset    
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], truncation=True, max_length=context_window)  # padding="max_length", 
+    
+    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+    
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False  # GPT-2 does not use masked language modeling
+    )
+    
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        overwrite_output_dir=True,
+        num_train_epochs=max_epochs,
+        per_device_train_batch_size=batch_size,
+        learning_rate=learning_rate, 
+        save_steps=500,
+        save_total_limit=2,
+        prediction_loss_only=True,
+        logging_dir="./logs",
+        fp16=(device == 'cuda'),  # Enable mixed precision for GPUs
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        data_collator=data_collator,
+        train_dataset=tokenized_dataset,
+    )
+    
+    trainer.train()
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+    return model, tokenizer
+
+
+def train_model_scratch_on_texts(text_file, output_dir="./fine_tuned_model"):
+    global device, max_epochs, batch_size
+    global context_window, learning_rate
     
     model_name = "gpt2"
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
@@ -104,6 +159,7 @@ def train_model_on_texts(text_file, output_dir="./fine_tuned_model"):
         overwrite_output_dir=True,
         num_train_epochs=max_epochs,
         per_device_train_batch_size=batch_size,
+        learning_rate=learning_rate,
         save_steps=500,
         save_total_limit=2,
         prediction_loss_only=True,
@@ -127,15 +183,19 @@ def train_model_on_texts(text_file, output_dir="./fine_tuned_model"):
 
 def load_or_train_model(folder_path, model_name="gpt2", output_dir="./fine_tuned_model"):    
     global context_window
+    global mode
     
     if os.path.exists(output_dir) and os.listdir(output_dir):
         print("Loading existing fine-tuned model...")
         model = GPT2LMHeadModel.from_pretrained(output_dir).to(device)
         tokenizer = GPT2Tokenizer.from_pretrained(output_dir)
     else:
-        print("No fine-tuned model found.  Training...")
+        print(f"No fine-tuned model found.  Training {mode}...")
         text_file = read_text_files(folder_path)
-        model, tokenizer = train_model_on_texts(text_file, output_dir)
+        if mode == 'pretrained':
+            model, tokenizer = train_model_pretrained_on_texts(text_file, output_dir)
+        else:
+            model, tokenizer = train_model_scratch_on_texts(text_file, output_dir)
         
     return model, tokenizer
 
@@ -145,6 +205,7 @@ def answer_questions(model, tokenizer, question):
     
     model.eval()  # Ensure the model is in evaluation mode
     inputs = tokenizer(question, return_tensors="pt", padding=True).to(device)
+
     outputs = model.generate(
         inputs["input_ids"],
         do_sample=(temperature is not None),
@@ -154,7 +215,16 @@ def answer_questions(model, tokenizer, question):
         pad_token_id=tokenizer.eos_token_id
     )
     
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    # Apply stop tokens
+    stop_tokens = ['.', '?', '\n']
+    for stop_token in stop_tokens:
+        if stop_token in generated_text:
+            generated_text = generated_text.split(stop_token)[0]
+            break
+
+    return generated_text
 
 
 def build_llm():
@@ -173,7 +243,7 @@ def build_llm():
             print("Bye!")
             return 0
         answer = answer_questions(model, tokenizer, question)
-        print(f"Answer: {answer}")
+        print(f"Answer: {answer}.")
 
 
 def main():
